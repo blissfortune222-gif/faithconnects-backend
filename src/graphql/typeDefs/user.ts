@@ -57,12 +57,21 @@ export const userTypes = /* GraphQL */ `
 
   extend type Mutation {
     signup(fullName: String!, email: String!, password: String!): AuthPayload!
+
     login(email: String!, password: String!): AuthPayload!
+
     updateProfile(input: UpdateProfileInput!): User!
     updateInterests(interests: [String!]!): User!
     updatePrivacy(input: UpdatePrivacyInput!): User!
     updateAppearance(input: UpdateAppearanceInput!): User!
     setOnlineStatus(isOnline: Boolean!): User!
+
+    # Password recovery with email OTP
+    requestPasswordResetOTP(email: String!): Boolean!
+
+    verifyPasswordResetOTP(email: String!, otp: String!): String!
+
+    resetPassword(resetToken: String!, newPassword: String!): Boolean!
 
     # Block another user
     blockUser(userId: ID!): Boolean!
