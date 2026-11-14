@@ -5,19 +5,25 @@ const gmailUser = process.env.GMAIL_USER?.trim();
 const gmailPassword = process.env.GMAIL_APP_PASSWORD?.replace(/\s/g, "");
 
 if (!gmailUser || !gmailPassword) {
-  console.error("Missing Gmail SMTP credentials.");
-  console.error("GMAIL_USER loaded:", Boolean(gmailUser));
-  console.error("GMAIL_APP_PASSWORD loaded:", Boolean(gmailPassword));
+  console.error("[SMTP] Missing Gmail SMTP credentials.");
+  console.error("[SMTP] GMAIL_USER loaded:", Boolean(gmailUser));
+  console.error("[SMTP] GMAIL_APP_PASSWORD loaded:", Boolean(gmailPassword));
 }
 
 const transporter = nodemailer.createTransport({
   host: "smtp.gmail.com",
   port: 465,
   secure: true,
+
   auth: {
     user: gmailUser,
     pass: gmailPassword,
   },
+
+  // Prevent SMTP requests from hanging indefinitely.
+  connectionTimeout: 15000,
+  greetingTimeout: 15000,
+  socketTimeout: 20000,
 });
 
 export const sendPasswordResetOTPEmail = async ({
@@ -37,6 +43,7 @@ export const sendPasswordResetOTPEmail = async ({
     from: `"FaithConnect" <${gmailUser}>`,
     to,
     subject: "Your FaithConnect Password Reset Code",
+
     html: `
       <div style="
         font-family: Arial, sans-serif;
@@ -88,9 +95,35 @@ export const sendPasswordResetOTPEmail = async ({
     `,
   };
 
-  const result = await transporter.sendMail(mailOptions);
+  try {
+    console.log("[SMTP] Starting password reset email delivery...");
+    console.log("[SMTP] Recipient:", to);
+    console.log("[SMTP] Connecting to smtp.gmail.com:465...");
 
-  console.log("Password reset email sent:", result.messageId);
+    const result = await transporter.sendMail(mailOptions);
 
-  return result;
+    console.log("[SMTP] Email sent successfully.");
+    console.log("[SMTP] Message ID:", result.messageId);
+    console.log("[SMTP] Response:", result.response);
+
+    return result;
+  } catch (error: unknown) {
+    const smtpError = error as {
+      message?: string;
+      code?: string;
+      command?: string;
+      response?: string;
+      responseCode?: number;
+    };
+
+    console.error("[SMTP] PASSWORD RESET EMAIL FAILED:", {
+      message: smtpError.message,
+      code: smtpError.code,
+      command: smtpError.command,
+      response: smtpError.response,
+      responseCode: smtpError.responseCode,
+    });
+
+    throw error;
+  }
 };
