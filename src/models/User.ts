@@ -28,6 +28,15 @@ export interface IUser extends Document {
   blockedUsers?: Types.ObjectId[];
   privacy: PrivacySettings;
   appearance: AppearanceSettings;
+
+  // Password reset fields
+  resetPasswordOTP?: string;
+  resetPasswordOTPExpires?: Date;
+  resetPasswordOTPAttempts: number;
+  resetPasswordLastSentAt?: Date;
+  resetPasswordToken?: string;
+  resetPasswordTokenExpires?: Date;
+
   createdAt: Date;
   updatedAt: Date;
 }
@@ -145,7 +154,6 @@ const userSchema = new Schema<IUser>(
       type: Date,
     },
 
-    // Users blocked by this account
     blockedUsers: {
       type: [
         {
@@ -165,6 +173,38 @@ const userSchema = new Schema<IUser>(
       type: appearanceSchema,
       default: () => ({}),
     },
+
+    // Password reset fields
+    resetPasswordOTP: {
+      type: String,
+      select: false,
+    },
+
+    resetPasswordOTPExpires: {
+      type: Date,
+      select: false,
+    },
+
+    resetPasswordOTPAttempts: {
+      type: Number,
+      default: 0,
+      select: false,
+    },
+
+    resetPasswordLastSentAt: {
+      type: Date,
+      select: false,
+    },
+
+    resetPasswordToken: {
+      type: String,
+      select: false,
+    },
+
+    resetPasswordTokenExpires: {
+      type: Date,
+      select: false,
+    },
   },
   {
     timestamps: true,
@@ -174,10 +214,16 @@ const userSchema = new Schema<IUser>(
 userSchema.index({ createdAt: -1 });
 userSchema.index({ location: 1, isOnline: 1 });
 
-// Never return the password hash in toJSON
 userSchema.set("toJSON", {
   transform: (_doc, ret: any) => {
     delete ret.password;
+    delete ret.resetPasswordOTP;
+    delete ret.resetPasswordOTPExpires;
+    delete ret.resetPasswordOTPAttempts;
+    delete ret.resetPasswordLastSentAt;
+    delete ret.resetPasswordToken;
+    delete ret.resetPasswordTokenExpires;
+
     return ret;
   },
 });
