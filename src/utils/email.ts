@@ -168,7 +168,7 @@ export const sendPasswordResetOTPEmail = async ({
   const safeName = escapeHtml(name?.trim() || "there");
 
   const mailOptions = {
-    from: "FaithConnect <onboarding@resend.dev>",
+    from: "FaithConnect <familyconnects@resend.dev>",
     to,
     subject: "Your FaithConnect Password Reset Code",
 
