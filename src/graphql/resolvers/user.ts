@@ -5,7 +5,10 @@ import { User, IUser } from "../../models/User";
 import { requireUser } from "../../middleware/auth";
 import { hashPassword, comparePassword } from "../../utils/password";
 import { signToken } from "../../utils/jwt";
-import { sendPasswordResetOTPEmail } from "../../utils/email";
+import {
+  sendPasswordResetOTPEmail,
+  sendSignupOTPEmail,
+} from "../../utils/email";
 
 import {
   getFollowersCount,
@@ -26,7 +29,7 @@ import {
    ========================================================= */
 
 const validateEmail = (email: string): boolean =>
-  /^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(email);
+  typeof email === "string" && /^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(email);
 
 const validatePassword = (password: string): boolean =>
   typeof password === "string" && password.length >= 6;
@@ -43,10 +46,6 @@ const OTP_RESEND_COOLDOWN = 60 * 1000;
 const MAX_OTP_ATTEMPTS = 5;
 const RESET_TOKEN_EXPIRY = 10 * 60 * 1000;
 
-/**
- * Debug logger.
- * Never pass passwords, raw OTPs, reset tokens, or hashes.
- */
 const debugLog = (section: string, message: string, data?: unknown) => {
   if (data !== undefined) {
     console.log(`[${section}] ${message}`, data);
@@ -56,8 +55,39 @@ const debugLog = (section: string, message: string, data?: unknown) => {
 };
 
 const debugError = (section: string, message: string, error: unknown) => {
+  // Avoid logging sensitive values such as passwords, OTPs or tokens.
   console.error(`[${section}] ${message}`, error);
 };
+
+const clearSignupOTP = (doc: any) => {
+  doc.signupOTP = undefined;
+  doc.signupOTPExpires = undefined;
+  doc.signupOTPAttempts = 0;
+  doc.signupOTPLastSentAt = undefined;
+};
+
+const clearResetOTP = (doc: any) => {
+  doc.resetPasswordOTP = undefined;
+  doc.resetPasswordOTPExpires = undefined;
+  doc.resetPasswordOTPAttempts = 0;
+  doc.resetPasswordLastSentAt = undefined;
+};
+
+/**
+ * Treat legacy accounts without isEmailVerified as verified.
+ * New signup explicitly stores false.
+ */
+const verifiedEmailFilter = {
+  $or: [{ isEmailVerified: true }, { isEmailVerified: { $exists: false } }],
+};
+
+/**
+ * Combine the legacy-compatible verification filter with
+ * additional query conditions.
+ */
+const verifiedUsersQuery = (conditions: Record<string, any> = {}) => ({
+  $and: [verifiedEmailFilter, conditions],
+});
 
 /* =========================================================
    USER RESOLVERS
@@ -65,21 +95,16 @@ const debugError = (section: string, message: string, error: unknown) => {
 
 export const userResolvers = {
   User: {
-    followersCount: (parent: IUser) => {
-      return getFollowersCount(String(parent._id));
-    },
+    // Legacy accounts without this field are treated as verified.
+    isEmailVerified: (parent: any) => parent.isEmailVerified ?? true,
 
-    followingCount: (parent: IUser) => {
-      return getFollowingCount(String(parent._id));
-    },
+    followersCount: (parent: IUser) => getFollowersCount(String(parent._id)),
 
-    likesCount: (parent: IUser) => {
-      return getLikesCount(String(parent._id));
-    },
+    followingCount: (parent: IUser) => getFollowingCount(String(parent._id)),
 
-    postsCount: (parent: IUser) => {
-      return getPostsCount(String(parent._id));
-    },
+    likesCount: (parent: IUser) => getLikesCount(String(parent._id)),
+
+    postsCount: (parent: IUser) => getPostsCount(String(parent._id)),
 
     compatibility: (parent: any) => {
       if (!parent._compatibilityViewerInterests) return null;
@@ -94,7 +119,10 @@ export const userResolvers = {
         parent.interests || [],
       );
 
-      return { score, sharedInterests: shared };
+      return {
+        score,
+        sharedInterests: shared,
+      };
     },
   },
 
@@ -110,47 +138,37 @@ export const userResolvers = {
       const doc = await User.findById(toObjectId(user.id));
 
       if (!doc) {
-        debugLog("ME", "User not found.");
         throw new Error("User not found.");
       }
-
-      debugLog("ME", "Authenticated user fetched successfully.");
 
       return doc;
     },
 
     user: async (_: any, { id }: { id: string }, context: any) => {
-      debugLog("USER", "Fetching user profile.");
-
       if (!Types.ObjectId.isValid(id)) {
-        debugLog("USER", "Invalid user ID.");
         throw new Error("Invalid user id.");
       }
 
       const doc = await User.findById(id);
 
       if (!doc) {
-        debugLog("USER", "User profile not found.");
         throw new Error("User not found.");
       }
 
       const viewer = context.user;
 
       if (viewer && String(doc._id) === viewer.id) {
-        debugLog("USER", "Returning own profile.");
         return doc;
       }
 
       if (doc.privacy?.profileVisibility === "private") {
         if (!viewer) {
-          debugLog("USER", "Private profile requested without authentication.");
           throw new Error("This profile is private.");
         }
 
         const canSee = await isFollowing(viewer.id, String(doc._id));
 
         if (!canSee) {
-          debugLog("USER", "Private profile access denied.");
           throw new Error("This profile is private.");
         }
       }
@@ -160,8 +178,6 @@ export const userResolvers = {
           (await User.findById(viewer.id).select("interests"))?.interests || [];
       }
 
-      debugLog("USER", "User profile fetched successfully.");
-
       return doc;
     },
 
@@ -170,18 +186,12 @@ export const userResolvers = {
       { limit, offset }: { limit: number; offset: number },
       context: any,
     ) => {
-      debugLog("USERS", "Fetching users.", { limit, offset });
-
       requireUser(context);
 
-      const docs = await User.find()
+      return User.find(verifiedUsersQuery())
         .sort({ createdAt: -1 })
         .skip(offset)
         .limit(limit);
-
-      debugLog("USERS", "Users fetched.", { count: docs.length });
-
-      return docs;
     },
 
     discoverNearby: async (
@@ -189,34 +199,27 @@ export const userResolvers = {
       { limit, offset }: { limit: number; offset: number },
       context: any,
     ) => {
-      debugLog("DISCOVER NEARBY", "Starting nearby discovery.");
-
       const viewer = requireUser(context);
 
       const me = await User.findById(toObjectId(viewer.id)).select(
         "location interests",
       );
 
-      const query: any = {
+      const conditions: Record<string, any> = {
         _id: { $ne: toObjectId(viewer.id) },
       };
 
       if (me?.location) {
-        query.location = me.location;
+        conditions.location = me.location;
       }
 
-      const docs = await User.find(query)
+      const docs = await User.find(verifiedUsersQuery(conditions))
         .sort({ createdAt: -1 })
         .skip(offset)
         .limit(limit);
 
-      docs.forEach(
-        (doc) =>
-          ((doc as any)._compatibilityViewerInterests = me?.interests || []),
-      );
-
-      debugLog("DISCOVER NEARBY", "Discovery completed.", {
-        count: docs.length,
+      docs.forEach((doc) => {
+        (doc as any)._compatibilityViewerInterests = me?.interests || [];
       });
 
       return docs;
@@ -227,26 +230,21 @@ export const userResolvers = {
       { limit, offset }: { limit: number; offset: number },
       context: any,
     ) => {
-      debugLog("DISCOVER NEW", "Starting new-user discovery.");
-
       const viewer = requireUser(context);
 
       const me = await User.findById(toObjectId(viewer.id)).select("interests");
 
-      const docs = await User.find({
-        _id: { $ne: toObjectId(viewer.id) },
-      })
+      const docs = await User.find(
+        verifiedUsersQuery({
+          _id: { $ne: toObjectId(viewer.id) },
+        }),
+      )
         .sort({ createdAt: -1 })
         .skip(offset)
         .limit(limit);
 
-      docs.forEach(
-        (doc) =>
-          ((doc as any)._compatibilityViewerInterests = me?.interests || []),
-      );
-
-      debugLog("DISCOVER NEW", "Discovery completed.", {
-        count: docs.length,
+      docs.forEach((doc) => {
+        (doc as any)._compatibilityViewerInterests = me?.interests || [];
       });
 
       return docs;
@@ -257,28 +255,23 @@ export const userResolvers = {
       { limit, offset }: { limit: number; offset: number },
       context: any,
     ) => {
-      debugLog("DISCOVER ONLINE", "Starting online-user discovery.");
-
       const viewer = requireUser(context);
 
       const me = await User.findById(toObjectId(viewer.id)).select("interests");
 
-      const docs = await User.find({
-        _id: { $ne: toObjectId(viewer.id) },
-        isOnline: true,
-        "privacy.showOnlineStatus": true,
-      })
+      const docs = await User.find(
+        verifiedUsersQuery({
+          _id: { $ne: toObjectId(viewer.id) },
+          isOnline: true,
+          "privacy.showOnlineStatus": true,
+        }),
+      )
         .sort({ lastSeen: -1 })
         .skip(offset)
         .limit(limit);
 
-      docs.forEach(
-        (doc) =>
-          ((doc as any)._compatibilityViewerInterests = me?.interests || []),
-      );
-
-      debugLog("DISCOVER ONLINE", "Discovery completed.", {
-        count: docs.length,
+      docs.forEach((doc) => {
+        (doc as any)._compatibilityViewerInterests = me?.interests || [];
       });
 
       return docs;
@@ -289,27 +282,22 @@ export const userResolvers = {
       { limit, offset }: { limit: number; offset: number },
       context: any,
     ) => {
-      debugLog("DISCOVER VERIFIED", "Starting verified-user discovery.");
-
       const viewer = requireUser(context);
 
       const me = await User.findById(toObjectId(viewer.id)).select("interests");
 
-      const docs = await User.find({
-        _id: { $ne: toObjectId(viewer.id) },
-        isVerified: true,
-      })
+      const docs = await User.find(
+        verifiedUsersQuery({
+          _id: { $ne: toObjectId(viewer.id) },
+          isVerified: true,
+        }),
+      )
         .sort({ createdAt: -1 })
         .skip(offset)
         .limit(limit);
 
-      docs.forEach(
-        (doc) =>
-          ((doc as any)._compatibilityViewerInterests = me?.interests || []),
-      );
-
-      debugLog("DISCOVER VERIFIED", "Discovery completed.", {
-        count: docs.length,
+      docs.forEach((doc) => {
+        (doc as any)._compatibilityViewerInterests = me?.interests || [];
       });
 
       return docs;
@@ -339,7 +327,7 @@ export const userResolvers = {
     ) => {
       debugLog("SIGNUP", "Signup request received.");
 
-      if (!fullName || !fullName.trim()) {
+      if (!fullName?.trim()) {
         throw new Error("Full name is required.");
       }
 
@@ -353,29 +341,322 @@ export const userResolvers = {
 
       const normalized = email.toLowerCase().trim();
 
-      const existing = await User.findOne({ email: normalized });
+      const existing = await User.findOne({
+        email: normalized,
+      });
 
       if (existing) {
-        debugLog("SIGNUP", "Signup rejected: email already exists.");
-        throw new Error("A user with this email already exists.");
+        // Missing field means this is a legacy, already-existing account.
+        if (existing.isEmailVerified !== false) {
+          throw new Error("A user with this email already exists.");
+        }
+
+        throw new Error(
+          "This account has not been verified. Please request a new verification code.",
+        );
       }
 
-      const hashed = await hashPassword(password);
+      const hashedPassword = await hashPassword(password);
+      const otp = generateOTP();
+      const now = Date.now();
 
       const doc = await User.create({
         fullName: fullName.trim(),
         email: normalized,
-        password: hashed,
+        password: hashedPassword,
+
+        isEmailVerified: false,
+
+        signupOTP: hashValue(otp),
+        signupOTPExpires: new Date(now + OTP_EXPIRY),
+        signupOTPAttempts: 0,
+        signupOTPLastSentAt: new Date(now),
+
+        isOnline: false,
       });
+
+      debugLog("SIGNUP", "Unverified account created.", {
+        userId: String(doc._id),
+      });
+
+      try {
+        await sendSignupOTPEmail({
+          to: normalized,
+          name: doc.fullName,
+          otp,
+        });
+
+        debugLog("SIGNUP", "Signup verification email accepted.");
+
+        return {
+          success: true,
+          message: "Verification code sent to your email.",
+        };
+      } catch (error) {
+        debugError("SIGNUP", "Signup email request failed.", error);
+
+        const pending: any = await User.findById(doc._id).select(
+          "+signupOTP +signupOTPExpires +signupOTPAttempts +signupOTPLastSentAt",
+        );
+
+        if (pending) {
+          clearSignupOTP(pending);
+          await pending.save();
+        }
+
+        throw new Error(
+          "Your account was created, but we couldn't send the verification email. Please request a new code.",
+        );
+      }
+    },
+
+    /* =======================================================
+       VERIFY SIGNUP OTP
+       ======================================================= */
+
+    verifySignupOTP: async (
+      _: any,
+      {
+        email,
+        otp,
+      }: {
+        email: string;
+        otp: string;
+      },
+    ) => {
+      debugLog("SIGNUP OTP", "Verification request received.");
+
+      if (!validateEmail(email)) {
+        throw new Error("Invalid or expired verification code.");
+      }
+
+      if (typeof otp !== "string" || !/^\d{6}$/.test(otp)) {
+        throw new Error("Enter a valid six-digit verification code.");
+      }
+
+      const normalized = email.toLowerCase().trim();
+
+      const doc: any = await User.findOne({
+        email: normalized,
+      }).select(
+        "+signupOTP +signupOTPExpires +signupOTPAttempts +signupOTPLastSentAt",
+      );
+
+      if (!doc) {
+        throw new Error("Invalid or expired verification code.");
+      }
+
+      if (doc.isEmailVerified === true) {
+        throw new Error("This email address is already verified.");
+      }
+
+      if (!doc.signupOTP || !doc.signupOTPExpires) {
+        throw new Error(
+          "No active verification code. Please request a new one.",
+        );
+      }
+
+      const now = Date.now();
+      const expiry = new Date(doc.signupOTPExpires).getTime();
+
+      if (expiry <= now) {
+        clearSignupOTP(doc);
+        await doc.save();
+
+        throw new Error(
+          "Verification code has expired. Please request a new one.",
+        );
+      }
+
+      if ((doc.signupOTPAttempts || 0) >= MAX_OTP_ATTEMPTS) {
+        clearSignupOTP(doc);
+        await doc.save();
+
+        throw new Error(
+          "Too many incorrect attempts. Please request a new code.",
+        );
+      }
+
+      const submittedHash = hashValue(otp);
+
+      if (submittedHash !== doc.signupOTP) {
+        /*
+         * Atomic increment: prevents two simultaneous incorrect
+         * requests from both using the same attempt count.
+         */
+        const updated: any = await User.findOneAndUpdate(
+          {
+            _id: doc._id,
+            isEmailVerified: false,
+            signupOTP: doc.signupOTP,
+            signupOTPExpires: { $gt: new Date() },
+            signupOTPAttempts: { $lt: MAX_OTP_ATTEMPTS },
+          },
+          {
+            $inc: { signupOTPAttempts: 1 },
+          },
+          {
+            new: true,
+          },
+        ).select("+signupOTPAttempts");
+
+        if (!updated) {
+          throw new Error(
+            "Verification code is no longer valid. Please request a new one.",
+          );
+        }
+
+        const attempts = updated.signupOTPAttempts || 0;
+
+        if (attempts >= MAX_OTP_ATTEMPTS) {
+          await User.updateOne(
+            {
+              _id: doc._id,
+              isEmailVerified: false,
+              signupOTP: doc.signupOTP,
+            },
+            {
+              $unset: {
+                signupOTP: 1,
+                signupOTPExpires: 1,
+                signupOTPLastSentAt: 1,
+              },
+              $set: {
+                signupOTPAttempts: 0,
+              },
+            },
+          );
+
+          throw new Error(
+            "Too many incorrect attempts. Please request a new code.",
+          );
+        }
+
+        throw new Error(
+          `Incorrect verification code. ${MAX_OTP_ATTEMPTS - attempts} attempts remaining.`,
+        );
+      }
+
+      /*
+       * Only verify if the same OTP is still active and unexpired.
+       * This prevents an old OTP from verifying an account after
+       * a newer code has been issued.
+       */
+      const verified: any = await User.findOneAndUpdate(
+        {
+          _id: doc._id,
+          isEmailVerified: false,
+          signupOTP: submittedHash,
+          signupOTPExpires: { $gt: new Date() },
+          signupOTPAttempts: { $lt: MAX_OTP_ATTEMPTS },
+        },
+        {
+          $set: {
+            isEmailVerified: true,
+            signupOTPAttempts: 0,
+          },
+          $unset: {
+            signupOTP: 1,
+            signupOTPExpires: 1,
+            signupOTPLastSentAt: 1,
+          },
+        },
+        {
+          new: true,
+        },
+      );
+
+      if (!verified) {
+        throw new Error(
+          "Verification code is no longer valid. Please request a new one.",
+        );
+      }
 
       const token = signToken({
-        id: String(doc._id),
-        email: doc.email,
+        id: String(verified._id),
+        email: verified.email,
       });
 
-      debugLog("SIGNUP", "User registered successfully.");
+      debugLog("SIGNUP OTP", "Email verified successfully.", {
+        userId: String(verified._id),
+      });
 
-      return { token, user: doc };
+      return {
+        token,
+        user: verified,
+      };
+    },
+
+    /* =======================================================
+       RESEND SIGNUP OTP
+       ======================================================= */
+
+    resendSignupOTP: async (_: any, { email }: { email: string }) => {
+      debugLog("RESEND SIGNUP OTP", "Resend request received.");
+
+      if (!validateEmail(email)) {
+        throw new Error("Please enter a valid email address.");
+      }
+
+      const normalized = email.toLowerCase().trim();
+
+      const doc: any = await User.findOne({
+        email: normalized,
+      }).select(
+        "+signupOTP +signupOTPExpires +signupOTPAttempts +signupOTPLastSentAt",
+      );
+
+      if (!doc) {
+        throw new Error("No account found with this email address.");
+      }
+
+      if (doc.isEmailVerified === true) {
+        throw new Error("This email address is already verified.");
+      }
+
+      const now = Date.now();
+
+      if (doc.signupOTPLastSentAt) {
+        const elapsed = now - new Date(doc.signupOTPLastSentAt).getTime();
+
+        if (elapsed < OTP_RESEND_COOLDOWN) {
+          const remaining = Math.ceil((OTP_RESEND_COOLDOWN - elapsed) / 1000);
+
+          throw new Error(
+            `Please wait ${remaining} seconds before requesting another code.`,
+          );
+        }
+      }
+
+      const otp = generateOTP();
+
+      doc.signupOTP = hashValue(otp);
+      doc.signupOTPExpires = new Date(now + OTP_EXPIRY);
+      doc.signupOTPAttempts = 0;
+      doc.signupOTPLastSentAt = new Date(now);
+
+      await doc.save();
+
+      try {
+        await sendSignupOTPEmail({
+          to: doc.email,
+          name: doc.fullName,
+          otp,
+        });
+
+        debugLog("RESEND SIGNUP OTP", "New OTP email accepted.");
+
+        return true;
+      } catch (error) {
+        debugError("RESEND SIGNUP OTP", "Email request failed.", error);
+
+        clearSignupOTP(doc);
+        await doc.save();
+
+        throw new Error(
+          "Unable to send verification code. Please try again later.",
+        );
+      }
     },
 
     /* =======================================================
@@ -394,22 +675,30 @@ export const userResolvers = {
     ) => {
       debugLog("LOGIN", "Login request received.");
 
+      if (!validateEmail(email)) {
+        throw new Error("Invalid credentials.");
+      }
+
       const normalized = email.toLowerCase().trim();
 
-      const doc = await User.findOne({
+      const doc: any = await User.findOne({
         email: normalized,
       }).select("+password");
 
       if (!doc) {
-        debugLog("LOGIN", "Login failed: account not found.");
         throw new Error("Invalid credentials.");
       }
 
-      const ok = await comparePassword(password, (doc as any).password);
+      const ok = await comparePassword(password, doc.password);
 
       if (!ok) {
-        debugLog("LOGIN", "Login failed: password mismatch.");
         throw new Error("Invalid credentials.");
+      }
+
+      // Only explicitly unverified accounts are blocked.
+      // Legacy accounts without this field remain able to log in.
+      if (doc.isEmailVerified === false) {
+        throw new Error("Please verify your email address before logging in.");
       }
 
       const token = signToken({
@@ -417,11 +706,21 @@ export const userResolvers = {
         email: doc.email,
       });
 
-      (doc as any).password = undefined;
+      doc.isOnline = true;
+      doc.lastSeen = new Date();
 
-      debugLog("LOGIN", "Login successful.");
+      await doc.save();
 
-      return { token, user: doc };
+      doc.password = undefined;
+
+      debugLog("LOGIN", "Login successful.", {
+        userId: String(doc._id),
+      });
+
+      return {
+        token,
+        user: doc,
+      };
     },
 
     /* =======================================================
@@ -432,7 +731,6 @@ export const userResolvers = {
       debugLog("OTP REQUEST", "Password reset OTP request received.");
 
       if (!validateEmail(email)) {
-        debugLog("OTP REQUEST", "Rejected: invalid email format.");
         throw new Error("Please enter a valid email address.");
       }
 
@@ -441,108 +739,53 @@ export const userResolvers = {
       const doc: any = await User.findOne({
         email: normalized,
       }).select(
-        "+resetPasswordOTP " +
-          "+resetPasswordOTPExpires " +
-          "+resetPasswordOTPAttempts " +
-          "+resetPasswordLastSentAt " +
-          "+resetPasswordToken " +
-          "+resetPasswordTokenExpires",
+        "+resetPasswordOTP +resetPasswordOTPExpires +resetPasswordOTPAttempts +resetPasswordLastSentAt +resetPasswordToken +resetPasswordTokenExpires",
       );
 
-      // Generic response prevents account enumeration.
+      // Generic response avoids revealing registered email addresses.
       if (!doc) {
-        debugLog(
-          "OTP REQUEST",
-          "No matching account. Returning generic response.",
-        );
-
         return true;
       }
 
       const now = Date.now();
 
-      // Enforce resend cooldown.
       if (doc.resetPasswordLastSentAt) {
         const elapsed = now - new Date(doc.resetPasswordLastSentAt).getTime();
 
         if (elapsed < OTP_RESEND_COOLDOWN) {
-          const remainingSeconds = Math.ceil(
-            (OTP_RESEND_COOLDOWN - elapsed) / 1000,
-          );
-
-          debugLog("OTP REQUEST", "Resend cooldown active.", {
-            remainingSeconds,
-          });
-
-          // The frontend must not display a successful send message.
           return false;
         }
       }
 
       const otp = generateOTP();
-      const otpHash = hashValue(otp);
 
-      doc.resetPasswordOTP = otpHash;
+      doc.resetPasswordOTP = hashValue(otp);
       doc.resetPasswordOTPExpires = new Date(now + OTP_EXPIRY);
       doc.resetPasswordOTPAttempts = 0;
       doc.resetPasswordLastSentAt = new Date(now);
 
-      // Invalidate previous reset authorization.
       doc.resetPasswordToken = undefined;
       doc.resetPasswordTokenExpires = undefined;
 
-      debugLog("OTP REQUEST", "Saving newly generated OTP.");
-
       await doc.save();
 
-      // Verify that the OTP hash was persisted.
-      const savedDoc: any = await User.findById(doc._id).select(
-        "+resetPasswordOTP",
-      );
-
-      const hashSavedCorrectly = savedDoc?.resetPasswordOTP === otpHash;
-
-      debugLog("OTP REQUEST", "OTP persistence check completed.", {
-        saved: Boolean(savedDoc?.resetPasswordOTP),
-        hashMatchesGeneratedOTP: hashSavedCorrectly,
-        storedHashLength: savedDoc?.resetPasswordOTP?.length || 0,
-      });
-
-      if (!hashSavedCorrectly) {
-        debugLog("OTP REQUEST", "OTP persistence verification failed.");
-
-        throw new Error(
-          "Unable to generate verification code. Please try again.",
-        );
-      }
-
       try {
-        debugLog("OTP REQUEST", "Attempting to send OTP email.");
-
         await sendPasswordResetOTPEmail({
           to: doc.email,
           name: doc.fullName,
           otp,
         });
 
-        debugLog("OTP REQUEST", "OTP email delivery completed.");
-
         return true;
       } catch (error) {
-        debugError("OTP REQUEST", "OTP email delivery failed.", error);
+        debugError(
+          "OTP REQUEST",
+          "Password reset email request failed.",
+          error,
+        );
 
-        // Invalidate OTP after delivery failure.
-        doc.resetPasswordOTP = undefined;
-        doc.resetPasswordOTPExpires = undefined;
-        doc.resetPasswordOTPAttempts = 0;
-        doc.resetPasswordLastSentAt = undefined;
-
-        doc.resetPasswordToken = undefined;
-        doc.resetPasswordTokenExpires = undefined;
-
+        clearResetOTP(doc);
         await doc.save();
-
-        debugLog("OTP REQUEST", "Failed OTP cleared. Resend cooldown reset.");
 
         throw new Error(
           "Unable to send verification code. Please try again later.",
@@ -564,92 +807,40 @@ export const userResolvers = {
         otp: string;
       },
     ) => {
-      debugLog("OTP VERIFY", "OTP verification request received.");
+      debugLog("OTP VERIFY", "Password reset verification received.");
 
-      if (!email || typeof email !== "string") {
-        debugLog("OTP VERIFY", "Rejected: email is missing or invalid.");
+      if (!validateEmail(email)) {
+        throw new Error("Invalid or expired verification code.");
+      }
+
+      if (typeof otp !== "string" || !/^\d{6}$/.test(otp)) {
         throw new Error("Invalid or expired verification code.");
       }
 
       const normalized = email.toLowerCase().trim();
 
-      if (!validateEmail(normalized)) {
-        debugLog("OTP VERIFY", "Rejected: invalid email format.");
-        throw new Error("Invalid or expired verification code.");
-      }
-
-      if (typeof otp !== "string" || !/^\d{6}$/.test(otp)) {
-        debugLog("OTP VERIFY", "Rejected: OTP must be exactly six digits.", {
-          receivedType: typeof otp,
-          receivedLength: typeof otp === "string" ? otp.length : null,
-        });
-
-        throw new Error("Invalid or expired verification code.");
-      }
-
-      debugLog("OTP VERIFY", "Looking up account and stored OTP.");
-
       const doc: any = await User.findOne({
         email: normalized,
       }).select(
-        "+resetPasswordOTP " +
-          "+resetPasswordOTPExpires " +
-          "+resetPasswordOTPAttempts",
+        "+resetPasswordOTP +resetPasswordOTPExpires +resetPasswordOTPAttempts +resetPasswordLastSentAt",
       );
 
-      if (!doc) {
-        debugLog("OTP VERIFY", "Verification failed: account not found.");
-        throw new Error("Invalid or expired verification code.");
-      }
-
-      if (!doc.resetPasswordOTP || !doc.resetPasswordOTPExpires) {
-        debugLog(
-          "OTP VERIFY",
-          "Verification failed: stored OTP or expiry is missing.",
-          {
-            hasStoredOTP: Boolean(doc.resetPasswordOTP),
-            hasExpiry: Boolean(doc.resetPasswordOTPExpires),
-          },
-        );
-
+      if (!doc || !doc.resetPasswordOTP || !doc.resetPasswordOTPExpires) {
         throw new Error("Invalid or expired verification code.");
       }
 
       const now = Date.now();
+      const expiry = new Date(doc.resetPasswordOTPExpires).getTime();
 
-      const expiryTime = new Date(doc.resetPasswordOTPExpires).getTime();
-
-      debugLog("OTP VERIFY", "OTP record found.", {
-        hasStoredOTP: Boolean(doc.resetPasswordOTP),
-        storedHashLength: doc.resetPasswordOTP.length,
-        attempts: doc.resetPasswordOTPAttempts || 0,
-        expiresAt: new Date(expiryTime).toISOString(),
-        isExpired: expiryTime <= now,
-      });
-
-      // Check expiry.
-      if (expiryTime <= now) {
-        debugLog("OTP VERIFY", "OTP has expired. Clearing OTP.");
-
-        doc.resetPasswordOTP = undefined;
-        doc.resetPasswordOTPExpires = undefined;
-        doc.resetPasswordOTPAttempts = 0;
-        doc.resetPasswordLastSentAt = undefined;
-
+      if (expiry <= now) {
+        clearResetOTP(doc);
         await doc.save();
 
         throw new Error("Verification code has expired.");
       }
 
-      // Check maximum attempts.
       if ((doc.resetPasswordOTPAttempts || 0) >= MAX_OTP_ATTEMPTS) {
-        debugLog("OTP VERIFY", "Maximum OTP attempts reached.");
-
-        doc.resetPasswordOTP = undefined;
-        doc.resetPasswordOTPExpires = undefined;
-        doc.resetPasswordOTPAttempts = 0;
-        doc.resetPasswordLastSentAt = undefined;
-
+        clearResetOTP(doc);
         await doc.save();
 
         throw new Error(
@@ -657,67 +848,88 @@ export const userResolvers = {
         );
       }
 
-      // Hash submitted OTP.
-      const submittedHash = hashValue(otp);
+      if (hashValue(otp) !== doc.resetPasswordOTP) {
+        const updated: any = await User.findOneAndUpdate(
+          {
+            _id: doc._id,
+            resetPasswordOTP: doc.resetPasswordOTP,
+            resetPasswordOTPExpires: { $gt: new Date() },
+            resetPasswordOTPAttempts: { $lt: MAX_OTP_ATTEMPTS },
+          },
+          {
+            $inc: { resetPasswordOTPAttempts: 1 },
+          },
+          {
+            new: true,
+          },
+        ).select("+resetPasswordOTPAttempts");
 
-      const hashMatches = submittedHash === doc.resetPasswordOTP;
-
-      debugLog("OTP VERIFY", "Hash comparison completed.", {
-        submittedLength: otp.length,
-        submittedHashLength: submittedHash.length,
-        storedHashLength: doc.resetPasswordOTP.length,
-        hashMatches,
-      });
-
-      if (!hashMatches) {
-        const previousAttempts = doc.resetPasswordOTPAttempts || 0;
-        const newAttempts = previousAttempts + 1;
-
-        doc.resetPasswordOTPAttempts = newAttempts;
-
-        debugLog("OTP VERIFY", "OTP mismatch.", {
-          previousAttempts,
-          newAttempts,
-          maximumAttempts: MAX_OTP_ATTEMPTS,
-        });
-
-        if (newAttempts >= MAX_OTP_ATTEMPTS) {
-          debugLog("OTP VERIFY", "Maximum attempts reached. Invalidating OTP.");
-
-          doc.resetPasswordOTP = undefined;
-          doc.resetPasswordOTPExpires = undefined;
-          doc.resetPasswordOTPAttempts = 0;
-          doc.resetPasswordLastSentAt = undefined;
+        if (!updated) {
+          throw new Error(
+            "Verification code is no longer valid. Please request a new one.",
+          );
         }
 
-        await doc.save();
+        if (updated.resetPasswordOTPAttempts >= MAX_OTP_ATTEMPTS) {
+          await User.updateOne(
+            {
+              _id: doc._id,
+              resetPasswordOTP: doc.resetPasswordOTP,
+            },
+            {
+              $unset: {
+                resetPasswordOTP: 1,
+                resetPasswordOTPExpires: 1,
+                resetPasswordLastSentAt: 1,
+              },
+              $set: {
+                resetPasswordOTPAttempts: 0,
+              },
+            },
+          );
+
+          throw new Error(
+            "Too many incorrect attempts. Please request a new code.",
+          );
+        }
 
         throw new Error("Incorrect verification code.");
       }
 
-      // OTP successfully verified.
-      debugLog("OTP VERIFY", "OTP verified successfully.");
-
       const resetToken = generateResetToken();
 
-      doc.resetPasswordToken = hashValue(resetToken);
-      doc.resetPasswordTokenExpires = new Date(now + RESET_TOKEN_EXPIRY);
+      const updated: any = await User.findOneAndUpdate(
+        {
+          _id: doc._id,
+          resetPasswordOTP: hashValue(otp),
+          resetPasswordOTPExpires: { $gt: new Date() },
+          resetPasswordOTPAttempts: { $lt: MAX_OTP_ATTEMPTS },
+        },
+        {
+          $set: {
+            resetPasswordToken: hashValue(resetToken),
+            resetPasswordTokenExpires: new Date(
+              Date.now() + RESET_TOKEN_EXPIRY,
+            ),
+            resetPasswordOTPAttempts: 0,
+          },
+          $unset: {
+            resetPasswordOTP: 1,
+            resetPasswordOTPExpires: 1,
+            resetPasswordLastSentAt: 1,
+          },
+        },
+        {
+          new: true,
+        },
+      );
 
-      // OTP can no longer be reused.
-      doc.resetPasswordOTP = undefined;
-      doc.resetPasswordOTPExpires = undefined;
-      doc.resetPasswordOTPAttempts = 0;
-      doc.resetPasswordLastSentAt = undefined;
+      if (!updated) {
+        throw new Error(
+          "Verification code is no longer valid. Please request a new one.",
+        );
+      }
 
-      await doc.save();
-
-      debugLog("OTP VERIFY", "Reset authorization created.", {
-        tokenGenerated: Boolean(resetToken),
-        tokenLength: resetToken.length,
-        expiresAt: new Date(now + RESET_TOKEN_EXPIRY).toISOString(),
-      });
-
-      // Return raw token only once to the client.
       return resetToken;
     },
 
@@ -738,67 +950,34 @@ export const userResolvers = {
       debugLog("RESET PASSWORD", "Password reset request received.");
 
       if (typeof resetToken !== "string" || resetToken.length !== 64) {
-        debugLog("RESET PASSWORD", "Rejected: invalid reset token format.");
-
         throw new Error("Invalid or expired password reset session.");
       }
 
       if (!validatePassword(newPassword)) {
-        debugLog(
-          "RESET PASSWORD",
-          "Rejected: password does not meet minimum length.",
-        );
-
         throw new Error("Password must be at least 6 characters.");
       }
 
-      const tokenHash = hashValue(resetToken);
-
-      debugLog(
-        "RESET PASSWORD",
-        "Looking up valid password reset authorization.",
-      );
-
       const doc: any = await User.findOne({
-        resetPasswordToken: tokenHash,
-        resetPasswordTokenExpires: {
-          $gt: new Date(),
-        },
+        resetPasswordToken: hashValue(resetToken),
+        resetPasswordTokenExpires: { $gt: new Date() },
       }).select(
-        "+password " + "+resetPasswordToken " + "+resetPasswordTokenExpires",
+        "+password +resetPasswordToken +resetPasswordTokenExpires +resetPasswordOTP +resetPasswordOTPExpires +resetPasswordOTPAttempts +resetPasswordLastSentAt",
       );
 
       if (!doc) {
-        debugLog("RESET PASSWORD", "Reset authorization not found or expired.");
-
         throw new Error("Invalid or expired password reset session.");
       }
 
-      debugLog(
-        "RESET PASSWORD",
-        "Valid reset authorization found. Hashing new password.",
-      );
+      doc.password = await hashPassword(newPassword);
 
-      const hashedPassword = await hashPassword(newPassword);
-
-      doc.password = hashedPassword;
-
-      // Invalidate reset authorization after use.
       doc.resetPasswordToken = undefined;
       doc.resetPasswordTokenExpires = undefined;
 
-      // Clear any remaining OTP information.
-      doc.resetPasswordOTP = undefined;
-      doc.resetPasswordOTPExpires = undefined;
-      doc.resetPasswordOTPAttempts = 0;
-      doc.resetPasswordLastSentAt = undefined;
+      clearResetOTP(doc);
 
       await doc.save();
 
-      debugLog(
-        "RESET PASSWORD",
-        "Password updated successfully. Reset authorization invalidated.",
-      );
+      debugLog("RESET PASSWORD", "Password updated successfully.");
 
       return true;
     },
@@ -808,14 +987,11 @@ export const userResolvers = {
        ======================================================= */
 
     updateProfile: async (_: any, { input }: any, context: any) => {
-      debugLog("UPDATE PROFILE", "Profile update request received.");
-
       const user = requireUser(context);
 
       const doc = await User.findById(toObjectId(user.id));
 
       if (!doc) {
-        debugLog("UPDATE PROFILE", "User not found.");
         throw new Error("User not found.");
       }
 
@@ -829,7 +1005,6 @@ export const userResolvers = {
           });
 
           if (clash) {
-            debugLog("UPDATE PROFILE", "Username already taken.");
             throw new Error("Username is already taken.");
           }
 
@@ -847,9 +1022,17 @@ export const userResolvers = {
         doc.fullName = input.fullName.trim();
       }
 
-      if (input.age !== undefined) doc.age = input.age;
-      if (input.bio !== undefined) doc.bio = input.bio;
-      if (input.location !== undefined) doc.location = input.location;
+      if (input.age !== undefined) {
+        doc.age = input.age;
+      }
+
+      if (input.bio !== undefined) {
+        doc.bio = input.bio;
+      }
+
+      if (input.location !== undefined) {
+        doc.location = input.location;
+      }
 
       if (input.profileImage !== undefined) {
         doc.profileImage = input.profileImage;
@@ -860,8 +1043,6 @@ export const userResolvers = {
       }
 
       await doc.save();
-
-      debugLog("UPDATE PROFILE", "Profile updated successfully.");
 
       return doc;
     },
@@ -875,22 +1056,17 @@ export const userResolvers = {
       { interests }: { interests: string[] },
       context: any,
     ) => {
-      debugLog("UPDATE INTERESTS", "Interests update request received.");
-
       const user = requireUser(context);
 
       const doc = await User.findById(toObjectId(user.id));
 
       if (!doc) {
-        debugLog("UPDATE INTERESTS", "User not found.");
         throw new Error("User not found.");
       }
 
       doc.interests = interests;
 
       await doc.save();
-
-      debugLog("UPDATE INTERESTS", "Interests updated successfully.");
 
       return doc;
     },
@@ -900,14 +1076,11 @@ export const userResolvers = {
        ======================================================= */
 
     updatePrivacy: async (_: any, { input }: any, context: any) => {
-      debugLog("UPDATE PRIVACY", "Privacy update request received.");
-
       const user = requireUser(context);
 
       const doc = await User.findById(toObjectId(user.id));
 
       if (!doc) {
-        debugLog("UPDATE PRIVACY", "User not found.");
         throw new Error("User not found.");
       }
 
@@ -918,8 +1091,6 @@ export const userResolvers = {
 
       await doc.save();
 
-      debugLog("UPDATE PRIVACY", "Privacy settings updated successfully.");
-
       return doc;
     },
 
@@ -928,14 +1099,11 @@ export const userResolvers = {
        ======================================================= */
 
     updateAppearance: async (_: any, { input }: any, context: any) => {
-      debugLog("UPDATE APPEARANCE", "Appearance update request received.");
-
       const user = requireUser(context);
 
       const doc = await User.findById(toObjectId(user.id));
 
       if (!doc) {
-        debugLog("UPDATE APPEARANCE", "User not found.");
         throw new Error("User not found.");
       }
 
@@ -945,11 +1113,6 @@ export const userResolvers = {
       } as any;
 
       await doc.save();
-
-      debugLog(
-        "UPDATE APPEARANCE",
-        "Appearance settings updated successfully.",
-      );
 
       return doc;
     },
@@ -963,25 +1126,26 @@ export const userResolvers = {
       { isOnline }: { isOnline: boolean },
       context: any,
     ) => {
-      debugLog("ONLINE STATUS", "Online status update received.", {
-        isOnline,
-      });
-
       const user = requireUser(context);
 
       const doc = await User.findById(toObjectId(user.id));
 
       if (!doc) {
-        debugLog("ONLINE STATUS", "User not found.");
         throw new Error("User not found.");
       }
 
       doc.isOnline = isOnline;
-      doc.lastSeen = new Date();
+
+      if (!isOnline) {
+        doc.lastSeen = new Date();
+      }
 
       await doc.save();
 
-      debugLog("ONLINE STATUS", "Online status updated successfully.");
+      debugLog("ONLINE STATUS", "Presence updated.", {
+        userId: String(doc._id),
+        isOnline: doc.isOnline,
+      });
 
       return doc;
     },

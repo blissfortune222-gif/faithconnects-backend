@@ -21,11 +21,22 @@ export interface IUser extends Document {
   bio?: string;
   location?: string;
   profileImage?: string;
+
+  // Existing profile verification
   isVerified: boolean;
+
+  // Email verification
+  isEmailVerified: boolean;
+  signupOTP?: string;
+  signupOTPExpires?: Date;
+  signupOTPAttempts: number;
+  signupOTPLastSentAt?: Date;
+
   interests: string[];
   isOnline: boolean;
   lastSeen?: Date;
   blockedUsers?: Types.ObjectId[];
+
   privacy: PrivacySettings;
   appearance: AppearanceSettings;
 
@@ -133,10 +144,41 @@ const userSchema = new Schema<IUser>(
       type: String,
     },
 
+    // Existing profile verification badge
     isVerified: {
       type: Boolean,
       default: false,
       index: true,
+    },
+
+    // Email verification is separate from profile verification.
+    // Default true preserves access for existing accounts.
+    // Signup must explicitly create new accounts with false.
+    isEmailVerified: {
+      type: Boolean,
+      default: true,
+      index: true,
+    },
+
+    signupOTP: {
+      type: String,
+      select: false,
+    },
+
+    signupOTPExpires: {
+      type: Date,
+      select: false,
+    },
+
+    signupOTPAttempts: {
+      type: Number,
+      default: 0,
+      select: false,
+    },
+
+    signupOTPLastSentAt: {
+      type: Date,
+      select: false,
     },
 
     interests: {
@@ -217,6 +259,14 @@ userSchema.index({ location: 1, isOnline: 1 });
 userSchema.set("toJSON", {
   transform: (_doc, ret: any) => {
     delete ret.password;
+
+    // Signup OTP fields
+    delete ret.signupOTP;
+    delete ret.signupOTPExpires;
+    delete ret.signupOTPAttempts;
+    delete ret.signupOTPLastSentAt;
+
+    // Password reset fields
     delete ret.resetPasswordOTP;
     delete ret.resetPasswordOTPExpires;
     delete ret.resetPasswordOTPAttempts;
@@ -228,4 +278,5 @@ userSchema.set("toJSON", {
   },
 });
 
-export const User: Model<IUser> = mongoose.model<IUser>("User", userSchema);
+export const User: Model<IUser> =
+  mongoose.models.User || mongoose.model<IUser>("User", userSchema);

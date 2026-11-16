@@ -53,6 +53,24 @@ const assertPostVisible = async (
 };
 
 /* =========================================================
+   COMMENT HELPERS
+========================================================= */
+
+const validateCommentText = (text: string): string => {
+  const cleanText = typeof text === "string" ? text.trim() : "";
+
+  if (!cleanText) {
+    throw new Error("Comment cannot be empty.");
+  }
+
+  if (cleanText.length > 1000) {
+    throw new Error("Comment cannot exceed 1000 characters.");
+  }
+
+  return cleanText;
+};
+
+/* =========================================================
    POST AND COMMENT FIELD RESOLVERS
 ========================================================= */
 
@@ -108,6 +126,10 @@ export const postResolvers = {
     },
   },
 
+  /* =========================================================
+     COMMENT FIELD RESOLVERS
+  ========================================================= */
+
   Comment: {
     author: async (parent: IComment, _: any, context: any) => {
       const authorId = String(parent.authorId);
@@ -132,6 +154,28 @@ export const postResolvers = {
 
       return author;
     },
+
+    parentComment: async (parent: IComment) => {
+      if (!parent.parentCommentId) {
+        return null;
+      }
+
+      return Comment.findById(parent.parentCommentId).exec();
+    },
+
+    replies: async (parent: IComment, _: any, context: any) => {
+      const blockedUserIds = context.user
+        ? await getBlockedUserIds(String(context.user.id))
+        : [];
+
+      return Comment.find({
+        postId: parent.postId,
+        parentCommentId: parent._id,
+        authorId: { $nin: blockedUserIds },
+      })
+        .sort({ createdAt: 1 })
+        .exec();
+    },
   },
 
   /* =========================================================
@@ -155,6 +199,7 @@ export const postResolvers = {
       console.log("📥 POSTS QUERY STARTED");
 
       const currentUser = requireUser(context);
+
       const blockedUserIds = await getBlockedUserIds(String(currentUser.id));
 
       const posts = await Post.find({
@@ -286,6 +331,12 @@ export const postResolvers = {
       },
       context: any,
     ) => {
+      console.log("💬 POST COMMENTS QUERY STARTED", {
+        postId,
+        limit,
+        offset,
+      });
+
       const currentUser = requireUser(context);
 
       if (!isValidId(postId)) {
@@ -294,7 +345,6 @@ export const postResolvers = {
 
       const blockedUserIds = await getBlockedUserIds(String(currentUser.id));
 
-      // Do not expose comments on a blocked user's post.
       const post = await Post.findOne({
         _id: toObjectId(postId),
         authorId: { $nin: blockedUserIds },
@@ -304,15 +354,23 @@ export const postResolvers = {
         throw new Error("Post not found or unavailable.");
       }
 
-      // Exclude comments written by blocked accounts.
-      return Comment.find({
+      // Only return top-level comments (replies come via Comment.replies)
+      const comments = await Comment.find({
         postId: toObjectId(postId),
+        $or: [
+          { parentCommentId: null },
+          { parentCommentId: { $exists: false } },
+        ],
         authorId: { $nin: blockedUserIds },
       })
         .sort({ createdAt: -1 })
         .skip(Math.max(0, offset))
         .limit(Math.min(Math.max(1, limit), 100))
         .exec();
+
+      console.log("✅ ROOT COMMENTS RETURNED:", comments.length);
+
+      return comments;
     },
   },
 
@@ -644,24 +702,35 @@ export const postResolvers = {
       return true;
     },
 
-    /* -------------------- CREATE COMMENT -------------------- */
+    /* =====================================================
+       CREATE COMMENT OR REPLY
+    ===================================================== */
 
     createComment: async (
       _: any,
       {
         postId,
         text,
+        parentCommentId,
       }: {
         postId: string;
         text: string;
+        parentCommentId?: string | null;
       },
       context: any,
     ) => {
+      console.log("💬 CREATE COMMENT STARTED", {
+        postId,
+        parentCommentId: parentCommentId ?? null,
+      });
+
       const user = requireUser(context);
 
       if (!isValidId(postId)) {
         throw new Error("Invalid post id.");
       }
+
+      const cleanText = validateCommentText(text);
 
       const post = await Post.findById(postId).exec();
 
@@ -671,29 +740,61 @@ export const postResolvers = {
 
       await assertPostVisible(post, String(user.id));
 
-      const cleanText = typeof text === "string" ? text.trim() : "";
-
-      if (!cleanText) {
-        throw new Error("Comment cannot be empty.");
-      }
-
-      if (cleanText.length > 1000) {
-        throw new Error("Comment cannot exceed 1000 characters.");
-      }
-
       const author = await User.findById(user.id).exec();
 
       if (!author) {
         throw new Error(`Authenticated user not found: ${user.id}`);
       }
 
+      let parentComment: IComment | null = null;
+
+      if (parentCommentId) {
+        if (!isValidId(parentCommentId)) {
+          throw new Error("Invalid parent comment id.");
+        }
+
+        parentComment = await Comment.findOne({
+          _id: toObjectId(parentCommentId),
+          postId: toObjectId(postId),
+        }).exec();
+
+        if (!parentComment) {
+          throw new Error("The comment you are replying to was not found.");
+        }
+
+        const blockedUserIds = await getBlockedUserIds(String(user.id));
+
+        if (isBlockedAuthor(parentComment.authorId, blockedUserIds)) {
+          throw new Error("You cannot reply to this comment.");
+        }
+      }
+
       const comment = await Comment.create({
         postId: toObjectId(postId),
         authorId: author._id,
         text: cleanText,
+        parentCommentId: parentComment ? parentComment._id : null,
       });
 
-      if (String(post.authorId) !== String(author._id)) {
+      console.log("✅ COMMENT CREATED", {
+        commentId: String(comment._id),
+        postId,
+        parentCommentId: parentComment ? String(parentComment._id) : null,
+      });
+
+      // Reply notification → parent comment author
+      if (parentComment) {
+        if (String(parentComment.authorId) !== String(author._id)) {
+          await Notification.create({
+            recipientId: parentComment.authorId,
+            senderId: author._id,
+            type: "COMMENT",
+            referenceId: toObjectId(postId),
+            message: "replied to your comment.",
+          });
+        }
+      } else if (String(post.authorId) !== String(author._id)) {
+        // Top-level comment notification → post author
         await Notification.create({
           recipientId: post.authorId,
           senderId: author._id,
@@ -706,9 +807,66 @@ export const postResolvers = {
       return comment;
     },
 
-    /* -------------------- DELETE COMMENT -------------------- */
+    /* =====================================================
+       UPDATE COMMENT
+    ===================================================== */
+
+    updateComment: async (
+      _: any,
+      {
+        id,
+        text,
+      }: {
+        id: string;
+        text: string;
+      },
+      context: any,
+    ) => {
+      console.log("✏️ UPDATE COMMENT STARTED", { id });
+
+      const user = requireUser(context);
+
+      if (!isValidId(id)) {
+        throw new Error("Invalid comment id.");
+      }
+
+      const cleanText = validateCommentText(text);
+
+      const comment = await Comment.findById(id).exec();
+
+      if (!comment) {
+        throw new Error("Comment not found.");
+      }
+
+      if (String(comment.authorId) !== String(user.id)) {
+        throw new Error("Unauthorized: you can only edit your own comments.");
+      }
+
+      const post = await Post.findById(comment.postId).exec();
+
+      if (!post) {
+        throw new Error("Post not found.");
+      }
+
+      await assertPostVisible(post, String(user.id));
+
+      comment.text = cleanText;
+      await comment.save();
+
+      console.log("✅ COMMENT UPDATED", {
+        commentId: String(comment._id),
+      });
+
+      return comment;
+    },
+
+    /* =====================================================
+       DELETE COMMENT AND ALL NESTED REPLIES
+    ===================================================== */
 
     deleteComment: async (_: any, { id }: { id: string }, context: any) => {
+      console.log("🗑️ DELETE COMMENT STARTED", { id });
+
       const user = requireUser(context);
 
       if (!isValidId(id)) {
@@ -725,7 +883,40 @@ export const postResolvers = {
         throw new Error("Unauthorized: you can only delete your own comments.");
       }
 
-      await comment.deleteOne();
+      const post = await Post.findById(comment.postId).exec();
+
+      if (!post) {
+        throw new Error("Post not found.");
+      }
+
+      await assertPostVisible(post, String(user.id));
+
+      // Collect this comment + every descendant reply
+      const idsToDelete: Types.ObjectId[] = [comment._id as Types.ObjectId];
+      let parentIds: Types.ObjectId[] = [comment._id as Types.ObjectId];
+
+      while (parentIds.length > 0) {
+        const children = await Comment.find({
+          parentCommentId: { $in: parentIds },
+        })
+          .select("_id")
+          .exec();
+
+        const childIds = children.map((child) => child._id as Types.ObjectId);
+
+        if (childIds.length === 0) break;
+
+        idsToDelete.push(...childIds);
+        parentIds = childIds;
+      }
+
+      await Comment.deleteMany({
+        _id: { $in: idsToDelete },
+      }).exec();
+
+      console.log("✅ COMMENT TREE DELETED", {
+        deletedCount: idsToDelete.length,
+      });
 
       return true;
     },

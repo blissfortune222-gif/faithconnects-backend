@@ -3,6 +3,7 @@ import mongoose, { Schema, Document, Model } from "mongoose";
 export interface IComment extends Document {
   postId: mongoose.Types.ObjectId;
   authorId: mongoose.Types.ObjectId;
+  parentCommentId: mongoose.Types.ObjectId | null;
   text: string;
   createdAt: Date;
   updatedAt: Date;
@@ -24,6 +25,13 @@ const commentSchema = new Schema<IComment>(
       index: true,
     },
 
+    parentCommentId: {
+      type: Schema.Types.ObjectId,
+      ref: "Comment",
+      default: null,
+      index: true,
+    },
+
     text: {
       type: String,
       required: true,
@@ -36,6 +44,7 @@ const commentSchema = new Schema<IComment>(
   },
 );
 
+// Existing indexes
 commentSchema.index({
   postId: 1,
   createdAt: -1,
@@ -44,6 +53,12 @@ commentSchema.index({
 commentSchema.index({
   authorId: 1,
   createdAt: -1,
+});
+
+// Efficiently retrieve replies belonging to a comment.
+commentSchema.index({
+  parentCommentId: 1,
+  createdAt: 1,
 });
 
 export const Comment: Model<IComment> =

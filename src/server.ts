@@ -53,7 +53,9 @@ async function startServer(): Promise<void> {
   app.get("/health", (_req, res) => res.json({ status: "ok" }));
 
   app.listen(port, () => {
-    console.log(`Family Connect API ready at http://localhost:${port}/graphql`);
+    console.log(
+      `Family Connect API reaqdy at http://localhost:${port}/graphql`,
+    );
   });
 }
 
